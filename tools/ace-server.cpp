@@ -47,19 +47,26 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #ifdef _WIN32
+#    include <direct.h>
 #    include <fcntl.h>
 #    include <io.h>
+#    include <windows.h>
+#    include <sys/stat.h>
 #    ifndef STDERR_FILENO
 #        define STDERR_FILENO 2
 #    endif
 #else
+#    include <dirent.h>
 #    include <unistd.h>
+#    include <sys/stat.h>
+#    include <sys/types.h>
 #endif
 
 // portable fd wrappers. avoids macros that collide with C++ method names
@@ -151,6 +158,9 @@ static AceUnderstandParams g_und_params;
 static int  g_max_batch   = 1;
 static int  g_mp3_kbps    = 128;
 static bool g_keep_loaded = false;
+
+// output directory for saving generation metadata
+static std::string g_output_dir;
 
 // log capture: intercept stderr via pipe, forward to terminal + ring buffer.
 // SSE clients connect to /logs and receive lines in real time.
@@ -816,6 +826,40 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
         ace_audio_free(&audio[b]);
     }
 
+    // save generation metadata if output directory is configured
+    if (!g_output_dir.empty() && !ace_reqs.empty()) {
+        // create output directory if needed
+        #ifdef _WIN32
+        _mkdir(g_output_dir.c_str());
+        #else
+        mkdir(g_output_dir.c_str(), 0755);
+        #endif
+        
+        char timestamp[32];
+        time_t now = time(nullptr);
+        struct tm * tm_info = localtime(&now);
+        strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm_info);
+        
+        for (int i = 0; i < (int) ace_reqs.size(); i++) {
+            char filename[256];
+            // sanitize caption for filename (keep alphanum and spaces)
+            std::string safe_caption = ace_reqs[i].caption;
+            for (auto & c : safe_caption) {
+                if (!isalnum(c) && c != ' ') c = '_';
+            }
+            if (safe_caption.length() > 30) {
+                safe_caption = safe_caption.substr(0, 30);
+            }
+            
+            snprintf(filename, sizeof(filename), "%s/%s_%s_%d_%lld.json", 
+                     g_output_dir.c_str(), timestamp, safe_caption.c_str(), i, (long long) ace_reqs[i].seed);
+            
+            if (request_write(&ace_reqs[i], filename)) {
+                fprintf(stderr, "[Server] Saved metadata: %s\n", filename);
+            }
+        }
+    }
+
     // single track: raw audio body
     if (total_tracks == 1) {
         if (encoded[0].empty()) {
@@ -1054,6 +1098,7 @@ static void usage(const char * prog) {
             "\n"
             "Output:\n"
             "  --mp3-bitrate <kbps>    MP3 bitrate (default: 128)\n"
+            "  --output-dir <dir>      Save generation metadata JSON files\n"
             "\n"
             "Server:\n"
             "  --host <addr>           Listen address (default: 127.0.0.1)\n"
@@ -1110,6 +1155,10 @@ int main(int argc, char ** argv) {
             port = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--max-batch") && i + 1 < argc) {
             g_max_batch = atoi(argv[++i]);
+
+            // output
+        } else if (!strcmp(argv[i], "--output-dir") && i + 1 < argc) {
+            g_output_dir = argv[++i];
 
             // debug
         } else if (!strcmp(argv[i], "--no-fsm")) {
@@ -1231,6 +1280,90 @@ int main(int argc, char ** argv) {
     });
     svr.Get("/props", handle_props);
     svr.Get("/logs", handle_logs);
+    
+    // download saved JSON metadata files
+    svr.Get("/json/:filename", [](const httplib::Request & req, httplib::Response & res) {
+        if (g_output_dir.empty()) {
+            json_error(res, 501, "JSON output not configured");
+            return;
+        }
+        auto filename = req.path_params.at("filename");
+        // security: only allow alphanumeric, underscore, dash, dot
+        for (auto c : filename) {
+            if (!isalnum(c) && c != '_' && c != '-' && c != '.') {
+                json_error(res, 400, "Invalid filename");
+                return;
+            }
+        }
+        std::string path = g_output_dir + "/" + filename;
+        FILE * f = fopen(path.c_str(), "rb");
+        if (!f) {
+            json_error(res, 404, "File not found");
+            return;
+        }
+        fseek(f, 0, SEEK_END);
+        long size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        std::string content(size, 0);
+        fread(content.data(), 1, size, f);
+        fclose(f);
+        res.set_content(content, "application/json");
+    });
+    
+    // list available JSON files
+    svr.Get("/jsons", [](const httplib::Request &, httplib::Response & res) {
+        if (g_output_dir.empty()) {
+            res.set_content("[]", "application/json");
+            return;
+        }
+        yyjson_mut_doc * doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val * root = yyjson_mut_arr(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        
+        #ifdef _WIN32
+        WIN32_FIND_DATAA findData;
+        HANDLE hFind = FindFirstFileA((g_output_dir + "/*.json").c_str(), &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                yyjson_mut_val * item = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_str(doc, item, "filename", findData.cFileName);
+                struct _stat64 st;
+                std::string fullpath = g_output_dir + "/" + findData.cFileName;
+                if (_stat64(fullpath.c_str(), &st) == 0) {
+                    yyjson_mut_obj_add_int(doc, item, "size", st.st_size);
+                    yyjson_mut_obj_add_int(doc, item, "mtime", st.st_mtime);
+                }
+                yyjson_mut_arr_append(root, item);
+            } while (FindNextFileA(hFind, &findData));
+            FindClose(hFind);
+        }
+        #else
+        DIR * dir = opendir(g_output_dir.c_str());
+        if (dir) {
+            struct dirent * entry;
+            while ((entry = readdir(dir)) != nullptr) {
+                std::string name = entry->d_name;
+                if (name.length() > 5 && name.substr(name.length() - 5) == ".json") {
+                    yyjson_mut_val * item = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_str(doc, item, "filename", name.c_str());
+                    struct stat st;
+                    std::string fullpath = g_output_dir + "/" + name;
+                    if (stat(fullpath.c_str(), &st) == 0) {
+                        yyjson_mut_obj_add_int(doc, item, "size", st.st_size);
+                        yyjson_mut_obj_add_int(doc, item, "mtime", st.st_mtime);
+                    }
+                    yyjson_mut_arr_append(root, item);
+                }
+            }
+            closedir(dir);
+        }
+        #endif
+        
+        const char * json = yyjson_mut_write(doc, 0, NULL);
+        res.set_content(json, "application/json");
+        free((void *)json);
+        yyjson_mut_doc_free(doc);
+    });
 
     // embedded webui: gzipped single-page app (built by tools/webui/).
     // the browser decompresses transparently via Content-Encoding: gzip.
