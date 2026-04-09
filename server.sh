@@ -6,9 +6,13 @@ set -eu
 #export GGML_BACKEND=CUDA0
 #export GGML_BACKEND=Vulkan0
 
-./build/ace-server \
+# Create output directory for generation metadata
+mkdir -p ../generations
+
+CUDA_VISIBLE_DEVICES=1 ./build/ace-server \
     --host 0.0.0.0 \
     --port 8085 \
-    --models ./models \
+    --models ../models/cuda \
     --loras ./loras \
-    --max-batch 1
+    --max-batch 1 \
+    --output-dir ../generations
