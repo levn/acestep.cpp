@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Play, Square, Pencil, Download, Trash2 } from '@lucide/svelte';
+	import { Play, Square, Pencil, Download, FileJson, Trash2 } from '@lucide/svelte';
 	import { app, setRequest } from '../lib/state.svelte.js';
 	import { deleteSong } from '../lib/db.js';
 	import type { Song } from '../lib/types.js';
@@ -55,13 +55,28 @@
 		app.pendingIndex = 0;
 	}
 
+	function baseName(): string {
+		const safe = song.name.replace(/[^a-zA-Z0-9 _-]/g, '') || 'song';
+		return song.genId ? `${safe}_${song.genId}_${song.seed}` : `${safe}_${song.seed}`;
+	}
+
 	function downloadAudio() {
 		const url = URL.createObjectURL(song.audio);
 		const a = document.createElement('a');
 		a.href = url;
-		const safe = song.name.replace(/[^a-zA-Z0-9 _-]/g, '') || 'song';
 		const ext = song.format === 'wav' ? '.wav' : '.mp3';
-		a.download = `${safe}_${song.seed}${ext}`;
+		a.download = `${baseName()}${ext}`;
+		a.click();
+		URL.revokeObjectURL(url);
+	}
+
+	function downloadJson() {
+		const json = JSON.stringify(song.request, null, 2);
+		const blob = new Blob([json], { type: 'application/json' });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = `${baseName()}.json`;
 		a.click();
 		URL.revokeObjectURL(url);
 	}
@@ -109,10 +124,13 @@
 		<span class="card-name">{song.name}</span>
 		<div class="card-actions">
 			<button class="icon-btn" onclick={downloadAudio} title="Download track"
-				><Download size={14} /> Download</button
+				><Download size={14} /></button
+			>
+			<button class="icon-btn" onclick={downloadJson} title="Download JSON"
+				><FileJson size={14} /></button
 			>
 			<button class="icon-btn" onclick={remove} title="Delete track"
-				><Trash2 size={14} /> Delete</button
+				><Trash2 size={14} /></button
 			>
 		</div>
 	</div>

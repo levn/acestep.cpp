@@ -50,6 +50,7 @@
 #include <ctime>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -558,19 +559,9 @@ static int clamp_int(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// save generation metadata JSON files to g_output_dir
-static void save_metadata(const std::vector<AceRequest> & reqs) {
-    if (g_output_dir.empty() || reqs.empty()) {
-        return;
-    }
-
-#ifdef _WIN32
-    _mkdir(g_output_dir.c_str());
-#else
-    mkdir(g_output_dir.c_str(), 0755);
-#endif
-
-    char   timestamp[32];
+// generate a unique ID: YYYYMMDD-HHMMSS-XXXX (timestamp + 4 random hex chars)
+static std::string generate_id() {
+    char   buf[64];
     time_t now = time(nullptr);
     struct tm tm_buf;
 #ifdef _WIN32
@@ -578,42 +569,106 @@ static void save_metadata(const std::vector<AceRequest> & reqs) {
 #else
     localtime_r(&now, &tm_buf);
 #endif
-    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &tm_buf);
+    uint32_t r = std::random_device{}();
+    snprintf(buf, sizeof(buf), "%04d%02d%02d-%02d%02d%02d-%04x", tm_buf.tm_year + 1900, tm_buf.tm_mon + 1,
+             tm_buf.tm_mday, tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, r & 0xFFFF);
+    return buf;
+}
 
-    for (int i = 0; i < (int) reqs.size(); i++) {
-        char filename[256];
-        std::string safe_caption = reqs[i].caption;
-        for (auto & c : safe_caption) {
-            if (!isalnum(c) && c != ' ') {
-                c = '_';
+// build a generation JSON: AceRequest fields + generation_id + model routing info
+static std::string build_generation_json(const AceRequest * r, const std::string & gen_id,
+                                         const std::string & dit_name, const std::string & lm_name,
+                                         const ServerFields & sf) {
+    // start from sparse AceRequest JSON
+    std::string base = request_to_json(r);
+    yyjson_doc * doc  = yyjson_read(base.c_str(), base.size(), 0);
+    yyjson_mut_doc * mdoc = yyjson_doc_mut_copy(doc, NULL);
+    yyjson_doc_free(doc);
+    yyjson_mut_val * root = yyjson_mut_doc_get_root(mdoc);
+
+    // add generation metadata
+    yyjson_mut_obj_add_str(mdoc, root, "generation_id", gen_id.c_str());
+
+    // add resolved model names
+    if (!dit_name.empty()) {
+        yyjson_mut_obj_add_str(mdoc, root, "synth_model", dit_name.c_str());
+    }
+    if (!lm_name.empty()) {
+        yyjson_mut_obj_add_str(mdoc, root, "lm_model", lm_name.c_str());
+    }
+    if (!sf.lora.empty()) {
+        yyjson_mut_obj_add_str(mdoc, root, "lora", sf.lora.c_str());
+        yyjson_mut_obj_add_real(mdoc, root, "lora_scale", sf.lora_scale);
+    }
+
+    yyjson_write_flag flags = YYJSON_WRITE_PRETTY | YYJSON_WRITE_PRETTY_TWO_SPACES | YYJSON_WRITE_FP_TO_FIXED(2);
+    size_t len;
+    char * json = yyjson_mut_write(mdoc, flags | YYJSON_WRITE_NEWLINE_AT_END, &len);
+    yyjson_mut_doc_free(mdoc);
+    std::string result(json, len);
+    free(json);
+    return result;
+}
+
+// ensure output directory exists
+static void ensure_output_dir() {
+#ifdef _WIN32
+    _mkdir(g_output_dir.c_str());
+#else
+    mkdir(g_output_dir.c_str(), 0755);
+#endif
+}
+
+// save generation: JSON metadata (with model info) + audio files to g_output_dir.
+// expanded = one AceRequest per audio track (with resolved seeds).
+static void save_generation(const std::string & gen_id, const std::vector<AceRequest> & expanded,
+                            const std::string & dit_name, const std::string & lm_name,
+                            const ServerFields & sf, const std::vector<std::string> & encoded, bool output_wav) {
+    if (g_output_dir.empty() || expanded.empty()) {
+        return;
+    }
+    ensure_output_dir();
+
+    const char * ext = output_wav ? ".wav" : ".mp3";
+    int          n   = (int) expanded.size();
+    if ((int) encoded.size() < n) {
+        n = (int) encoded.size();
+    }
+
+    for (int i = 0; i < n; i++) {
+        // save JSON with generation_id and model info
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s_%d.json", g_output_dir.c_str(), gen_id.c_str(), i);
+        std::string json = build_generation_json(&expanded[i], gen_id, dit_name, lm_name, sf);
+        FILE * f = fopen(path, "w");
+        if (f) {
+            fwrite(json.data(), 1, json.size(), f);
+            fclose(f);
+            fprintf(stderr, "[Server] Saved metadata: %s\n", path);
+        }
+
+        // save audio
+        if (!encoded[i].empty()) {
+            snprintf(path, sizeof(path), "%s/%s_%d%s", g_output_dir.c_str(), gen_id.c_str(), i, ext);
+            f = fopen(path, "wb");
+            if (f) {
+                fwrite(encoded[i].data(), 1, encoded[i].size(), f);
+                fclose(f);
+                fprintf(stderr, "[Server] Saved audio: %s\n", path);
             }
-        }
-        if (safe_caption.length() > 30) {
-            safe_caption = safe_caption.substr(0, 30);
-        }
-
-        snprintf(filename, sizeof(filename), "%s/%s_%s_%d_%lld.json", g_output_dir.c_str(), timestamp,
-                 safe_caption.c_str(), i, (long long) reqs[i].seed);
-
-        if (request_write(&reqs[i], filename)) {
-            fprintf(stderr, "[Server] Saved metadata: %s\n", filename);
         }
     }
 }
 
-// encode audio tracks and build HTTP response (single or multipart/mixed)
-static void encode_and_respond(std::vector<AceAudio> & audio, int total_tracks, bool output_wav,
-                               const httplib::Request & req, httplib::Response & res) {
-    const char * mime = output_wav ? "audio/wav" : "audio/mpeg";
-
+// encode audio tracks (normalize + MP3/WAV). frees AceAudio samples after encoding.
+static std::vector<std::string> encode_audio(std::vector<AceAudio> & audio, int total_tracks, bool output_wav,
+                                             const httplib::Request & req) {
     std::vector<std::string> encoded(total_tracks);
     for (int b = 0; b < total_tracks; b++) {
         if (!audio[b].samples) {
             continue;
         }
-
         audio_normalize(audio[b].samples, audio[b].n_samples * 2);
-
         if (output_wav) {
             encoded[b] = audio_encode_wav(audio[b].samples, audio[b].n_samples, 48000);
         } else {
@@ -622,8 +677,15 @@ static void encode_and_respond(std::vector<AceAudio> & audio, int total_tracks, 
         }
         ace_audio_free(&audio[b]);
     }
+    return encoded;
+}
 
-    if (total_tracks == 1) {
+// send encoded audio tracks as HTTP response (single or multipart/mixed)
+static void send_audio_response(const std::vector<std::string> & encoded, bool output_wav,
+                                httplib::Response & res) {
+    const char * mime = output_wav ? "audio/wav" : "audio/mpeg";
+
+    if ((int) encoded.size() == 1) {
         if (encoded[0].empty()) {
             json_error(res, 500, "Audio encoding failed");
             return;
@@ -635,12 +697,12 @@ static void encode_and_respond(std::vector<AceAudio> & audio, int total_tracks, 
     // multiple tracks: multipart/mixed
     std::string boundary = "ace-batch-boundary";
     std::string body;
-    for (int b = 0; b < total_tracks; b++) {
+    for (const auto & e : encoded) {
         body += "--" + boundary + "\r\n";
         body += "Content-Type: ";
         body += mime;
         body += "\r\n\r\n";
-        body += encoded[b];
+        body += e;
         body += "\r\n";
     }
     body += "--" + boundary + "--\r\n";
@@ -854,6 +916,10 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
         return;
     }
 
+    // expanded: one AceRequest per output track (with resolved seeds)
+    std::vector<AceRequest> expanded;
+    expanded.reserve(total_alloc);
+
     for (int ri = 0; ri < batch_n; ri++) {
         auto & r   = ace_reqs[ri];
         int    sbs = clamp_int(r.synth_batch_size, 1, MAX_SYNTH_BATCH);
@@ -888,6 +954,7 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
         }
 
         for (int i = 0; i < sbs; i++) {
+            expanded.push_back(group[i]);
             audio[audio_idx++] = group_audio[i];
         }
     }
@@ -895,10 +962,15 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
     maybe_unload_synth();
     lock.unlock();
 
-    save_metadata(ace_reqs);
+    // generate unique ID, encode audio, save to disk, respond
+    std::string gen_id     = generate_id();
+    bool        output_wav = req.has_param("wav") && req.get_param_value("wav") == "1";
+    auto        encoded    = encode_audio(audio, audio_idx, output_wav, req);
 
-    bool output_wav = req.has_param("wav") && req.get_param_value("wav") == "1";
-    encode_and_respond(audio, audio_idx, output_wav, req, res);
+    save_generation(gen_id, expanded, dit_name, "", sf, encoded, output_wav);
+
+    res.set_header("X-Generation-Id", gen_id);
+    send_audio_response(encoded, output_wav, res);
 }
 
 // POST /understand

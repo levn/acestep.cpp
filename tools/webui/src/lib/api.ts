@@ -1,6 +1,12 @@
 import type { AceRequest, AceProps } from './types.js';
 import { FETCH_TIMEOUT_MS } from './config.js';
 
+// result from synth endpoints: audio blobs + server-assigned generation ID
+export interface SynthResult {
+	blobs: Blob[];
+	genId: string;
+}
+
 // POST lm: partial request -> enriched request(s)
 export async function lmGenerate(req: AceRequest): Promise<AceRequest[]> {
 	const res = await fetch('lm', {
@@ -43,9 +49,9 @@ export async function lmFormat(req: AceRequest): Promise<AceRequest[]> {
 	return res.json();
 }
 
-// POST synth[?wav=1]: request(s) -> audio blob(s)
+// POST synth[?wav=1]: request(s) -> audio blob(s) + generation ID
 // Metadata (seed, duration, etc) is already in the request JSON from /lm.
-export async function synthGenerate(reqs: AceRequest[], format: string): Promise<Blob[]> {
+export async function synthGenerate(reqs: AceRequest[], format: string): Promise<SynthResult> {
 	const url = format === 'wav' ? 'synth?wav=1' : 'synth';
 	const body = reqs.length === 1 ? JSON.stringify(reqs[0]) : JSON.stringify(reqs);
 	const res = await fetch(url, {
@@ -58,28 +64,29 @@ export async function synthGenerate(reqs: AceRequest[], format: string): Promise
 		throw new Error(`${res.status} ${err.error || res.statusText}`);
 	}
 
+	const genId = res.headers.get('X-Generation-Id') || '';
 	const ct = res.headers.get('Content-Type') || '';
 
 	// single track: raw audio body
 	if (!ct.startsWith('multipart/')) {
-		return [await res.blob()];
+		return { blobs: [await res.blob()], genId };
 	}
 
 	// batch: multipart/mixed, each part is raw audio
 	const match = ct.match(/boundary=([^\s;]+)/);
 	if (!match) throw new Error('Missing boundary in multipart response');
 	const mime = format === 'wav' ? 'audio/wav' : 'audio/mpeg';
-	return parseMultipart(new Uint8Array(await res.arrayBuffer()), match[1], mime);
+	return { blobs: parseMultipart(new Uint8Array(await res.arrayBuffer()), match[1], mime), genId };
 }
 
-// POST synth (multipart): request(s) + source/reference audio -> audio blob(s).
+// POST synth (multipart): request(s) + source/reference audio -> audio blob(s) + generation ID.
 // src_audio = source content (cover/lego/repaint), ref_audio = timbre reference.
 export async function synthGenerateWithAudio(
 	reqs: AceRequest[],
 	srcAudio: Blob | null,
 	refAudio: Blob | null,
 	format: string
-): Promise<Blob[]> {
+): Promise<SynthResult> {
 	const url = format === 'wav' ? 'synth?wav=1' : 'synth';
 	const body = reqs.length === 1 ? JSON.stringify(reqs[0]) : JSON.stringify(reqs);
 	const form = new FormData();
@@ -92,14 +99,15 @@ export async function synthGenerateWithAudio(
 		throw new Error(`${res.status} ${err.error || res.statusText}`);
 	}
 
+	const genId = res.headers.get('X-Generation-Id') || '';
 	const ct = res.headers.get('Content-Type') || '';
 	if (!ct.startsWith('multipart/')) {
-		return [await res.blob()];
+		return { blobs: [await res.blob()], genId };
 	}
 	const match = ct.match(/boundary=([^\s;]+)/);
 	if (!match) throw new Error('Missing boundary in multipart response');
 	const mime = format === 'wav' ? 'audio/wav' : 'audio/mpeg';
-	return parseMultipart(new Uint8Array(await res.arrayBuffer()), match[1], mime);
+	return { blobs: parseMultipart(new Uint8Array(await res.arrayBuffer()), match[1], mime), genId };
 }
 
 // parse multipart/mixed binary response into Blob[].

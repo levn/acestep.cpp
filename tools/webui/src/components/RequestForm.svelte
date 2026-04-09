@@ -167,6 +167,7 @@
 				caption: result.caption || '',
 				seed: Number(result.seed) || 0,
 				duration: Number(result.duration) || 0,
+				genId: '',
 				request: { ...result },
 				audio: blob
 			};
@@ -366,6 +367,7 @@
 			if (im) synthParams.infer_method = im;
 			// model routing from form
 			if (app.request.synth_model) synthParams.synth_model = app.request.synth_model;
+			if (app.request.lm_model) synthParams.lm_model = app.request.lm_model;
 			if (app.request.lora && loraList.includes(String(app.request.lora)))
 				synthParams.lora = app.request.lora;
 			const loraScale = num(app.request.lora_scale);
@@ -397,7 +399,7 @@
 			const srcSong = app.srcSongId != null ? app.songs.find((s) => s.id === app.srcSongId) : null;
 			const refSong = app.refSongId != null ? app.songs.find((s) => s.id === app.refSongId) : null;
 
-			const blobs =
+			const result =
 				srcSong || refSong
 					? await synthGenerateWithAudio(
 							toSend,
@@ -406,6 +408,7 @@
 							app.format
 						)
 					: await synthGenerate(toSend, app.format);
+			const { blobs, genId } = result;
 			const now = Date.now();
 			const baseName = app.name || 'Untitled';
 			for (let i = blobs.length - 1; i >= 0; i--) {
@@ -417,6 +420,7 @@
 					caption: r.caption,
 					seed: r.seed || 0,
 					duration: r.duration || 0,
+					genId: genId,
 					request: r,
 					audio: blobs[i]
 				} as Song;

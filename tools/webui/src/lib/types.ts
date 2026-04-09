@@ -63,6 +63,7 @@ export interface Song {
 	caption: string;
 	seed: number;
 	duration: number;
+	genId: string;
 	request: AceRequest;
 	audio: Blob;
 }
