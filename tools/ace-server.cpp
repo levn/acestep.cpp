@@ -48,10 +48,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+// RAII wrapper for C-allocated buffers (free() on destruction)
+using unique_cfloat = std::unique_ptr<float, decltype(&free)>;
+static unique_cfloat make_cfloat(float * p = nullptr) {
+    return unique_cfloat(p, free);
+}
 
 #ifdef _WIN32
 #    include <direct.h>
@@ -155,6 +162,8 @@ static AceSynthParams      g_synth_params;
 static AceUnderstandParams g_und_params;
 
 // limits
+static constexpr int MAX_SYNTH_BATCH = 9;
+
 static int  g_max_batch   = 1;
 static int  g_mp3_kbps    = 128;
 static bool g_keep_loaded = false;
@@ -511,6 +520,133 @@ static bool ensure_synth(const std::string & dit_name, const std::string & lora_
     return true;
 }
 
+// try to acquire GPU mutex. returns lock on success, empty lock on failure (sets 503).
+static std::unique_lock<std::mutex> try_gpu_lock(httplib::Response & res) {
+    std::unique_lock<std::mutex> lock(mtx_gpu, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        json_busy(res);
+    }
+    return lock;
+}
+
+// conditionally unload LM pipeline (respects --keep-loaded)
+static void maybe_unload_lm() {
+    if (g_keep_loaded) {
+        return;
+    }
+    ace_understand_free(g_ctx_understand);
+    g_ctx_understand = nullptr;
+    ace_lm_free(g_ctx_lm);
+    g_ctx_lm = nullptr;
+    g_loaded_lm.clear();
+    g_loaded_und_dit.clear();
+}
+
+// conditionally unload synth pipeline (respects --keep-loaded)
+static void maybe_unload_synth() {
+    if (g_keep_loaded) {
+        return;
+    }
+    ace_synth_free(g_ctx_synth);
+    g_ctx_synth = nullptr;
+    g_loaded_dit.clear();
+    g_loaded_lora.clear();
+}
+
+// clamp value to [lo, hi]
+static int clamp_int(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// save generation metadata JSON files to g_output_dir
+static void save_metadata(const std::vector<AceRequest> & reqs) {
+    if (g_output_dir.empty() || reqs.empty()) {
+        return;
+    }
+
+#ifdef _WIN32
+    _mkdir(g_output_dir.c_str());
+#else
+    mkdir(g_output_dir.c_str(), 0755);
+#endif
+
+    char   timestamp[32];
+    time_t now = time(nullptr);
+    struct tm tm_buf;
+#ifdef _WIN32
+    localtime_s(&tm_buf, &now);
+#else
+    localtime_r(&now, &tm_buf);
+#endif
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &tm_buf);
+
+    for (int i = 0; i < (int) reqs.size(); i++) {
+        char filename[256];
+        std::string safe_caption = reqs[i].caption;
+        for (auto & c : safe_caption) {
+            if (!isalnum(c) && c != ' ') {
+                c = '_';
+            }
+        }
+        if (safe_caption.length() > 30) {
+            safe_caption = safe_caption.substr(0, 30);
+        }
+
+        snprintf(filename, sizeof(filename), "%s/%s_%s_%d_%lld.json", g_output_dir.c_str(), timestamp,
+                 safe_caption.c_str(), i, (long long) reqs[i].seed);
+
+        if (request_write(&reqs[i], filename)) {
+            fprintf(stderr, "[Server] Saved metadata: %s\n", filename);
+        }
+    }
+}
+
+// encode audio tracks and build HTTP response (single or multipart/mixed)
+static void encode_and_respond(std::vector<AceAudio> & audio, int total_tracks, bool output_wav,
+                               const httplib::Request & req, httplib::Response & res) {
+    const char * mime = output_wav ? "audio/wav" : "audio/mpeg";
+
+    std::vector<std::string> encoded(total_tracks);
+    for (int b = 0; b < total_tracks; b++) {
+        if (!audio[b].samples) {
+            continue;
+        }
+
+        audio_normalize(audio[b].samples, audio[b].n_samples * 2);
+
+        if (output_wav) {
+            encoded[b] = audio_encode_wav(audio[b].samples, audio[b].n_samples, 48000);
+        } else {
+            encoded[b] = audio_encode_mp3(audio[b].samples, audio[b].n_samples, 48000, g_mp3_kbps, server_cancel,
+                                          (void *) &req.is_connection_closed);
+        }
+        ace_audio_free(&audio[b]);
+    }
+
+    if (total_tracks == 1) {
+        if (encoded[0].empty()) {
+            json_error(res, 500, "Audio encoding failed");
+            return;
+        }
+        res.set_content(encoded[0], mime);
+        return;
+    }
+
+    // multiple tracks: multipart/mixed
+    std::string boundary = "ace-batch-boundary";
+    std::string body;
+    for (int b = 0; b < total_tracks; b++) {
+        body += "--" + boundary + "\r\n";
+        body += "Content-Type: ";
+        body += mime;
+        body += "\r\n\r\n";
+        body += encoded[b];
+        body += "\r\n";
+    }
+    body += "--" + boundary + "--\r\n";
+    res.set_content(body, "multipart/mixed; boundary=" + boundary);
+}
+
 // POST /lm[?mode=inspire|format]
 // accepts: AceRequest JSON (+ optional "lm_model" for LM selection)
 // returns: JSON array of enriched AceRequests (lm_batch_size controls count)
@@ -552,19 +688,10 @@ static void handle_lm(const httplib::Request & req, httplib::Response & res) {
         return;
     }
 
-    // clamp lm_batch_size to [1, max_batch]
-    int lm_batch_size = ace_req.lm_batch_size;
-    if (lm_batch_size < 1) {
-        lm_batch_size = 1;
-    }
-    if (lm_batch_size > g_max_batch) {
-        lm_batch_size = g_max_batch;
-    }
+    int lm_batch_size = clamp_int(ace_req.lm_batch_size, 1, g_max_batch);
 
-    // try to acquire GPU. 503 instantly if busy.
-    std::unique_lock<std::mutex> lock(mtx_gpu, std::try_to_lock);
+    auto lock = try_gpu_lock(res);
     if (!lock.owns_lock()) {
-        json_busy(res);
         return;
     }
 
@@ -580,15 +707,7 @@ static void handle_lm(const httplib::Request & req, httplib::Response & res) {
     int rc = ace_lm_generate(g_ctx_lm, &ace_req, lm_batch_size, out.data(), NULL, NULL, server_cancel,
                              (void *) &req.is_connection_closed, mode);
 
-    // free
-    if (!g_keep_loaded) {
-        ace_understand_free(g_ctx_understand);
-        g_ctx_understand = nullptr;
-        ace_lm_free(g_ctx_lm);
-        g_ctx_lm = nullptr;
-        g_loaded_lm.clear();
-        g_loaded_und_dit.clear();
-    }
+    maybe_unload_lm();
     lock.unlock();
 
     if (rc != 0) {
@@ -632,10 +751,10 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
 
     // parse request: plain JSON (single or array) or multipart (JSON + audio file)
     std::vector<AceRequest> ace_reqs;
-    float *                 src_interleaved = nullptr;
-    int                     src_len         = 0;
-    float *                 ref_interleaved = nullptr;
-    int                     ref_len         = 0;
+    auto src_interleaved = make_cfloat();
+    int  src_len         = 0;
+    auto ref_interleaved = make_cfloat();
+    int  ref_len         = 0;
 
     if (req.is_multipart_form_data()) {
         // multipart mode: single request + optional audio files
@@ -669,7 +788,7 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
                 return;
             }
             fprintf(stderr, "[Server] Source audio: %.2fs @ 48kHz\n", (float) T_audio / 48000.0f);
-            src_interleaved = audio_planar_to_interleaved(planar, T_audio);
+            src_interleaved.reset(audio_planar_to_interleaved(planar, T_audio));
             free(planar);
             src_len = T_audio;
         }
@@ -682,7 +801,7 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
                     audio_read_48k_buf((const uint8_t *) file.content.data(), file.content.size(), &T_audio);
                 if (planar && T_audio > 0) {
                     fprintf(stderr, "[Server] Reference audio: %.2fs @ 48kHz\n", (float) T_audio / 48000.0f);
-                    ref_interleaved = audio_planar_to_interleaved(planar, T_audio);
+                    ref_interleaved.reset(audio_planar_to_interleaved(planar, T_audio));
                     free(planar);
                     ref_len = T_audio;
                 } else {
@@ -718,39 +837,26 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
     int batch_n     = (int) ace_reqs.size();
     int total_alloc = 0;
     for (int ri = 0; ri < batch_n; ri++) {
-        int sbs = ace_reqs[ri].synth_batch_size;
-        total_alloc += sbs < 1 ? 1 : (sbs > 9 ? 9 : sbs);
+        total_alloc += clamp_int(ace_reqs[ri].synth_batch_size, 1, MAX_SYNTH_BATCH);
     }
     std::vector<AceAudio> audio(total_alloc);
     int                   audio_idx = 0;
 
-    // try_lock: 503 instantly if GPU busy.
-    std::unique_lock<std::mutex> lock(mtx_gpu, std::try_to_lock);
+    auto lock = try_gpu_lock(res);
     if (!lock.owns_lock()) {
-        free(src_interleaved);
-        free(ref_interleaved);
-        json_busy(res);
         return;
     }
 
     // load
     std::string dit_name = resolve_name(g_registry.dit, sf.synth_model, g_loaded_dit);
     if (!ensure_synth(dit_name, sf.lora, sf.lora_scale)) {
-        free(src_interleaved);
-        free(ref_interleaved);
         json_error(res, 500, "Failed to load synth pipeline");
         return;
     }
 
     for (int ri = 0; ri < batch_n; ri++) {
         auto & r   = ace_reqs[ri];
-        int    sbs = r.synth_batch_size;
-        if (sbs < 1) {
-            sbs = 1;
-        }
-        if (sbs > 9) {
-            sbs = 9;
-        }
+        int    sbs = clamp_int(r.synth_batch_size, 1, MAX_SYNTH_BATCH);
 
         // resolve seed once per original request
         request_resolve_seed(&r);
@@ -764,19 +870,13 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
         }
 
         std::vector<AceAudio> group_audio(sbs);
-        int rc = ace_synth_generate(g_ctx_synth, group.data(), src_interleaved, src_len, ref_interleaved, ref_len, sbs,
-                                    group_audio.data(), server_cancel, (void *) &req.is_connection_closed);
+        int rc = ace_synth_generate(g_ctx_synth, group.data(), src_interleaved.get(), src_len, ref_interleaved.get(),
+                                    ref_len, sbs, group_audio.data(), server_cancel,
+                                    (void *) &req.is_connection_closed);
 
         if (rc != 0) {
-            if (!g_keep_loaded) {
-                ace_synth_free(g_ctx_synth);
-                g_ctx_synth = nullptr;
-                g_loaded_dit.clear();
-                g_loaded_lora.clear();
-            }
+            maybe_unload_synth();
             lock.unlock();
-            free(src_interleaved);
-            free(ref_interleaved);
             for (int j = 0; j < audio_idx; j++) {
                 ace_audio_free(&audio[j]);
             }
@@ -792,99 +892,13 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
         }
     }
 
-    // free
-    if (!g_keep_loaded) {
-        ace_synth_free(g_ctx_synth);
-        g_ctx_synth = nullptr;
-        g_loaded_dit.clear();
-        g_loaded_lora.clear();
-    }
+    maybe_unload_synth();
     lock.unlock();
-    free(src_interleaved);
-    free(ref_interleaved);
-    int total_tracks = audio_idx;
 
-    // output format: ?wav=1 for WAV, default MP3
-    bool         output_wav = req.has_param("wav") && req.get_param_value("wav") == "1";
-    const char * mime       = output_wav ? "audio/wav" : "audio/mpeg";
+    save_metadata(ace_reqs);
 
-    // encode each track (peak normalize + encode)
-    std::vector<std::string> encoded(total_tracks);
-    for (int b = 0; b < total_tracks; b++) {
-        if (!audio[b].samples) {
-            continue;
-        }
-
-        audio_normalize(audio[b].samples, audio[b].n_samples * 2);
-
-        if (output_wav) {
-            encoded[b] = audio_encode_wav(audio[b].samples, audio[b].n_samples, 48000);
-        } else {
-            encoded[b] = audio_encode_mp3(audio[b].samples, audio[b].n_samples, 48000, g_mp3_kbps, server_cancel,
-                                          (void *) &req.is_connection_closed);
-        }
-        ace_audio_free(&audio[b]);
-    }
-
-    // save generation metadata if output directory is configured
-    if (!g_output_dir.empty() && !ace_reqs.empty()) {
-        // create output directory if needed
-        #ifdef _WIN32
-        _mkdir(g_output_dir.c_str());
-        #else
-        mkdir(g_output_dir.c_str(), 0755);
-        #endif
-        
-        char timestamp[32];
-        time_t now = time(nullptr);
-        struct tm * tm_info = localtime(&now);
-        strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm_info);
-        
-        for (int i = 0; i < (int) ace_reqs.size(); i++) {
-            char filename[256];
-            // sanitize caption for filename (keep alphanum and spaces)
-            std::string safe_caption = ace_reqs[i].caption;
-            for (auto & c : safe_caption) {
-                if (!isalnum(c) && c != ' ') c = '_';
-            }
-            if (safe_caption.length() > 30) {
-                safe_caption = safe_caption.substr(0, 30);
-            }
-            
-            snprintf(filename, sizeof(filename), "%s/%s_%s_%d_%lld.json", 
-                     g_output_dir.c_str(), timestamp, safe_caption.c_str(), i, (long long) ace_reqs[i].seed);
-            
-            if (request_write(&ace_reqs[i], filename)) {
-                fprintf(stderr, "[Server] Saved metadata: %s\n", filename);
-            }
-        }
-    }
-
-    // single track: raw audio body
-    if (total_tracks == 1) {
-        if (encoded[0].empty()) {
-            json_error(res, 500, "Audio encoding failed");
-            return;
-        }
-        res.set_content(encoded[0], mime);
-        return;
-    }
-
-    // multiple tracks: multipart/mixed, each part is raw audio
-    std::string boundary = "ace-batch-boundary";
-    std::string body;
-
-    for (int b = 0; b < total_tracks; b++) {
-        body += "--" + boundary + "\r\n";
-        body += "Content-Type: ";
-        body += mime;
-        body += "\r\n\r\n";
-        body += encoded[b];
-        body += "\r\n";
-    }
-    body += "--" + boundary + "--\r\n";
-
-    res.set_content(body, "multipart/mixed; boundary=" + boundary);
+    bool output_wav = req.has_param("wav") && req.get_param_value("wav") == "1";
+    encode_and_respond(audio, audio_idx, output_wav, req, res);
 }
 
 // POST /understand
@@ -908,8 +922,8 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
 
     // parse server fields + request
     ServerFields sf;
-    float *      src_interleaved = nullptr;
-    int          src_len         = 0;
+    auto src_interleaved = make_cfloat();
+    int  src_len         = 0;
 
     if (req.is_multipart_form_data()) {
         // multipart: required "audio" part, optional "request" part for sampling params
@@ -950,7 +964,7 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
         fprintf(stderr, "[Server] Understand source: %.2fs @ 48kHz\n", (float) T_audio / 48000.0f);
 
         // convert planar [L:T][R:T] to interleaved [L0,R0,L1,R1,...] for pipeline
-        src_interleaved = audio_planar_to_interleaved(planar, T_audio);
+        src_interleaved.reset(audio_planar_to_interleaved(planar, T_audio));
         free(planar);
         src_len = T_audio;
     } else {
@@ -962,11 +976,8 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
         }
     }
 
-    // try to acquire GPU. 503 instantly if busy.
-    std::unique_lock<std::mutex> lock(mtx_gpu, std::try_to_lock);
+    auto lock = try_gpu_lock(res);
     if (!lock.owns_lock()) {
-        free(src_interleaved);
-        json_busy(res);
         return;
     }
 
@@ -974,26 +985,16 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
     std::string lm_name  = resolve_name(g_registry.lm, sf.lm_model, g_loaded_lm);
     std::string dit_name = resolve_name(g_registry.dit, sf.synth_model, g_loaded_dit);
     if (!ensure_understand(lm_name, dit_name)) {
-        free(src_interleaved);
         json_error(res, 500, "Failed to load understand pipeline");
         return;
     }
 
     AceRequest out;
-    int        rc = ace_understand_generate(g_ctx_understand, src_interleaved, src_len, &ace_req, &out, server_cancel,
-                                            (void *) &req.is_connection_closed);
+    int        rc = ace_understand_generate(g_ctx_understand, src_interleaved.get(), src_len, &ace_req, &out,
+                                            server_cancel, (void *) &req.is_connection_closed);
 
-    // free
-    if (!g_keep_loaded) {
-        ace_understand_free(g_ctx_understand);
-        g_ctx_understand = nullptr;
-        ace_lm_free(g_ctx_lm);
-        g_ctx_lm = nullptr;
-        g_loaded_lm.clear();
-        g_loaded_und_dit.clear();
-    }
+    maybe_unload_lm();
     lock.unlock();
-    free(src_interleaved);
 
     if (rc != 0) {
         json_error(res, 500, "Understand generation failed");
@@ -1105,6 +1106,7 @@ static void usage(const char * prog) {
             "  --port <N>              Listen port (default: 8080)\n"
             "  --max-batch <N>         LM batch limit (default: 1)\n"
             "  --max-seq <N>           KV cache size (default: 8192)\n"
+            "  --cors                  Enable CORS (Access-Control-Allow-Origin: *)\n"
             "\n"
             "Debug:\n"
             "  --no-fsm                Disable FSM constrained decoding\n"
@@ -1118,10 +1120,11 @@ int main(int argc, char ** argv) {
     ace_lm_default_params(&g_lm_params);
     ace_synth_default_params(&g_synth_params);
 
-    const char * host       = "127.0.0.1";
-    int          port       = 8080;
-    const char * models_dir = nullptr;
-    const char * loras_dir  = nullptr;
+    const char * host        = "127.0.0.1";
+    int          port        = 8080;
+    const char * models_dir  = nullptr;
+    const char * loras_dir   = nullptr;
+    bool         enable_cors = false;
 
     if (argc < 2) {
         usage(argv[0]);
@@ -1171,6 +1174,8 @@ int main(int argc, char ** argv) {
         } else if (!strcmp(argv[i], "--clamp-fp16")) {
             g_lm_params.clamp_fp16    = true;
             g_synth_params.clamp_fp16 = true;
+        } else if (!strcmp(argv[i], "--cors")) {
+            enable_cors = true;
 
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             usage(argv[0]);
@@ -1233,13 +1238,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // clamp max_batch
-    if (g_max_batch < 1) {
-        g_max_batch = 1;
-    }
-    if (g_max_batch > 9) {
-        g_max_batch = 9;
-    }
+    g_max_batch = clamp_int(g_max_batch, 1, MAX_SYNTH_BATCH);
     g_lm_params.max_batch = g_max_batch;
 
     // init understand params (vae for audio encoding, dit resolved per-request)
@@ -1270,13 +1269,45 @@ int main(int argc, char ** argv) {
     // reject oversized bodies (256 MB: src + ref audio, up to 10min WAV each)
     svr.set_payload_max_length(256 * 1024 * 1024);
 
+    // CORS: allow cross-origin requests when --cors is set
+    if (enable_cors) {
+        svr.set_default_headers({
+            {"Access-Control-Allow-Origin",  "*"},
+            {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+            {"Access-Control-Allow-Headers", "Content-Type"},
+        });
+        svr.Options(".*", [](const httplib::Request &, httplib::Response & res) {
+            res.status = 204;
+        });
+    }
+
     // all endpoints are always registered. handlers return 501 when the
     // backing pipeline has no models in the registry.
     svr.Post("/lm", handle_lm);
     svr.Post("/synth", handle_synth);
     svr.Post("/understand", handle_understand);
-    svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
-        res.set_content("{\"status\":\"ok\"}", "application/json");
+    svr.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
+        bool gpu_busy = !mtx_gpu.try_lock();
+        if (!gpu_busy) {
+            mtx_gpu.unlock();
+        }
+
+        yyjson_mut_doc * doc  = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val * root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_obj_add_str(doc, root, "status", "ok");
+        yyjson_mut_obj_add_bool(doc, root, "gpu_busy", gpu_busy);
+
+        yyjson_mut_val * pipelines = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_val(doc, root, "pipelines", pipelines);
+        yyjson_mut_obj_add_bool(doc, pipelines, "lm", have_lm);
+        yyjson_mut_obj_add_bool(doc, pipelines, "synth", have_synth);
+        yyjson_mut_obj_add_bool(doc, pipelines, "understand", have_understand);
+
+        char * json = yyjson_mut_write(doc, 0, NULL);
+        yyjson_mut_doc_free(doc);
+        res.set_content(json, "application/json");
+        free(json);
     });
     svr.Get("/props", handle_props);
     svr.Get("/logs", handle_logs);
@@ -1288,7 +1319,11 @@ int main(int argc, char ** argv) {
             return;
         }
         auto filename = req.path_params.at("filename");
-        // security: only allow alphanumeric, underscore, dash, dot
+        // security: only allow alphanumeric, underscore, dash, dot; reject path traversal
+        if (filename.find("..") != std::string::npos) {
+            json_error(res, 400, "Invalid filename");
+            return;
+        }
         for (auto c : filename) {
             if (!isalnum(c) && c != '_' && c != '-' && c != '.') {
                 json_error(res, 400, "Invalid filename");
@@ -1305,8 +1340,12 @@ int main(int argc, char ** argv) {
         long size = ftell(f);
         fseek(f, 0, SEEK_SET);
         std::string content(size, 0);
-        fread(content.data(), 1, size, f);
+        size_t nread = fread(content.data(), 1, size, f);
         fclose(f);
+        if ((long) nread != size) {
+            json_error(res, 500, "Failed to read file");
+            return;
+        }
         res.set_content(content, "application/json");
     });
     
@@ -1359,10 +1398,10 @@ int main(int argc, char ** argv) {
         }
         #endif
         
-        const char * json = yyjson_mut_write(doc, 0, NULL);
-        res.set_content(json, "application/json");
-        free((void *)json);
+        char * json = yyjson_mut_write(doc, 0, NULL);
         yyjson_mut_doc_free(doc);
+        res.set_content(json, "application/json");
+        free(json);
     });
 
     // embedded webui: gzipped single-page app (built by tools/webui/).
@@ -1381,8 +1420,16 @@ int main(int argc, char ** argv) {
     }
 
     // graceful shutdown on SIGINT/SIGTERM
+#ifdef _WIN32
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+#else
+    struct sigaction sa = {};
+    sa.sa_handler       = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+#endif
 
     fprintf(stderr, "[Server] acestep.cpp %s\n", ACE_VERSION);
     fprintf(stderr, "[Server] Listening on %s:%d\n", host, port);
