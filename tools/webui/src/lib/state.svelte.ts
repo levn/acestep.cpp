@@ -8,6 +8,8 @@ interface Saved {
 	format: string;
 	dark: boolean;
 	logsOpen: boolean;
+	composeLmModel: string;
+	currentGenId: string;
 	request: AceRequest;
 }
 
@@ -22,6 +24,8 @@ function load(): Saved {
 				format: parsed.format === 'wav' ? 'wav' : 'mp3',
 				dark: parsed.dark ?? true,
 				logsOpen: parsed.logsOpen ?? true,
+				composeLmModel: parsed.composeLmModel || parsed.request?.lm_model || '',
+				currentGenId: parsed.currentGenId || '',
 				request: parsed.request || { caption: '' }
 			};
 		}
@@ -34,6 +38,8 @@ function load(): Saved {
 		format: 'mp3',
 		dark: false,
 		logsOpen: true,
+		composeLmModel: '',
+		currentGenId: '',
 		request: { caption: '' }
 	};
 }
@@ -46,6 +52,8 @@ export const app = $state({
 	format: saved.format,
 	dark: saved.dark,
 	logsOpen: saved.logsOpen,
+	composeLmModel: saved.composeLmModel,
+	currentGenId: saved.currentGenId,
 	request: saved.request as AceRequest,
 	songs: [] as Song[],
 	props: null as AceProps | null,
@@ -89,6 +97,8 @@ $effect.root(() => {
 			format: app.format,
 			dark: app.dark,
 			logsOpen: app.logsOpen,
+			composeLmModel: app.composeLmModel,
+			currentGenId: app.currentGenId,
 			request: app.request
 		};
 		localStorage.setItem(STORAGE_KEY, JSON.stringify(data));

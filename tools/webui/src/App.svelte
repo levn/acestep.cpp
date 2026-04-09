@@ -18,7 +18,12 @@
 	// poll /props every PROPS_POLL_MS, null on failure (grey badges)
 	function pollProps() {
 		props()
-			.then((h) => (app.props = h))
+			.then((h) => {
+				app.props = h;
+				if (!app.request.lm_model && h.models.lm.length > 0) app.request.lm_model = h.models.lm[0];
+				if (!app.request.synth_model && h.models.dit.length > 0)
+					app.request.synth_model = h.models.dit[0];
+			})
 			.catch(() => (app.props = null));
 	}
 

@@ -2,6 +2,7 @@
 	import { Play, Square, Pencil, Download, FileJson, Trash2 } from '@lucide/svelte';
 	import { app, setRequest } from '../lib/state.svelte.js';
 	import { deleteSong } from '../lib/db.js';
+	import { buildDownloadBaseName } from '../lib/filenames.js';
 	import type { Song } from '../lib/types.js';
 	import Waveform from './Waveform.svelte';
 
@@ -50,14 +51,23 @@
 
 	function load() {
 		app.name = song.name;
+		app.composeLmModel = song.request.lm_model || '';
+		app.currentGenId = song.genId || '';
 		setRequest({ ...song.request });
 		app.pendingRequests = [];
 		app.pendingIndex = 0;
 	}
 
 	function baseName(): string {
-		const safe = song.name.replace(/[^a-zA-Z0-9 _-]/g, '') || 'song';
-		return song.genId ? `${safe}_${song.genId}_${song.seed}` : `${safe}_${song.seed}`;
+		return buildDownloadBaseName(song.name, {
+			genId: song.genId,
+			seed: song.seed,
+			fallback: 'song'
+		});
+	}
+
+	function displayName(): string {
+		return song.genId ? `${song.name} [${song.genId}]` : song.name;
 	}
 
 	function downloadAudio() {
@@ -121,7 +131,7 @@
 				<Play size={14} />
 			{/if}
 		</button>
-		<span class="card-name">{song.name}</span>
+		<span class="card-name" title={displayName()}>{displayName()}</span>
 		<div class="card-actions">
 			<button class="icon-btn" onclick={downloadAudio} title="Download track"
 				><Download size={14} /></button

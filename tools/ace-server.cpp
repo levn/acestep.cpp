@@ -787,6 +787,7 @@ static void handle_lm(const httplib::Request & req, httplib::Response & res) {
     }
     body += "]";
 
+    res.set_header("X-LM-Model", lm_name);
     res.set_content(body, "application/json");
 }
 
@@ -967,7 +968,7 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
     bool        output_wav = req.has_param("wav") && req.get_param_value("wav") == "1";
     auto        encoded    = encode_audio(audio, audio_idx, output_wav, req);
 
-    save_generation(gen_id, expanded, dit_name, "", sf, encoded, output_wav);
+    save_generation(gen_id, expanded, dit_name, sf.lm_model, sf, encoded, output_wav);
 
     res.set_header("X-Generation-Id", gen_id);
     send_audio_response(encoded, output_wav, res);
@@ -1073,6 +1074,7 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
         return;
     }
 
+    res.set_header("X-LM-Model", lm_name);
     res.set_content(request_to_json(&out), "application/json");
 }
 

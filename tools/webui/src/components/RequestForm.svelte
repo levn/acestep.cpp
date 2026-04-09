@@ -11,6 +11,7 @@
 		understandAudio
 	} from '../lib/api.js';
 	import { putSong } from '../lib/db.js';
+	import { buildDownloadBaseName } from '../lib/filenames.js';
 	import {
 		TASK_COVER,
 		TASK_COVER_NOFSQ,
@@ -79,20 +80,32 @@
 
 	function reset() {
 		app.name = '';
+		app.composeLmModel = '';
+		app.currentGenId = '';
 		setRequest({ caption: '' });
 		app.pendingRequests = [];
 		app.pendingIndex = 0;
 		selectedTracks = new Set();
 	}
 
+	function resolvedLmModel(): string {
+		return app.composeLmModel || app.request.lm_model || '';
+	}
+
 	function exportJson() {
-		const json = JSON.stringify(buildRequest(), null, 2);
+		const req = buildRequest();
+		const lmModel = resolvedLmModel();
+		if (lmModel) req.lm_model = lmModel;
+		const json = JSON.stringify(req, null, 2);
 		const blob = new Blob([json], { type: 'application/json' });
 		const url = URL.createObjectURL(blob);
 		const a = document.createElement('a');
 		a.href = url;
-		const safe = app.name.replace(/[^a-zA-Z0-9 _-]/g, '') || 'request';
-		a.download = `${safe}.json`;
+		a.download = `${buildDownloadBaseName(app.name, {
+			genId: app.currentGenId,
+			seed: req.seed,
+			fallback: 'request'
+		})}.json`;
 		a.click();
 		URL.revokeObjectURL(url);
 	}
@@ -115,7 +128,11 @@
 			file
 				.text()
 				.then((text) => {
-					setRequest(JSON.parse(text) as AceRequest);
+					const parsed = JSON.parse(text) as AceRequest & { generation_id?: string };
+					setRequest(parsed);
+					app.composeLmModel = parsed.lm_model || '';
+					app.currentGenId =
+						typeof parsed.generation_id === 'string' ? parsed.generation_id : '';
 					app.name = file.name.replace(/\.json$/i, '') || 'Imported';
 					app.pendingRequests = [];
 					app.pendingIndex = 0;
@@ -145,13 +162,15 @@
 			const blob = new Blob([await file.arrayBuffer()], {
 				type: ext === 'wav' ? 'audio/wav' : 'audio/mpeg'
 			});
-			const result = await understandAudio(
+			const { request, lmModel } = await understandAudio(
 				blob,
 				app.request.lm_model as string,
 				app.request.synth_model as string
 			);
 
-			setRequest(result);
+			setRequest(request);
+			app.composeLmModel = lmModel || request.lm_model || '';
+			app.currentGenId = '';
 			app.pendingRequests = [];
 			app.pendingIndex = 0;
 
@@ -164,11 +183,11 @@
 				name: name,
 				format: ext,
 				created: Date.now(),
-				caption: result.caption || '',
-				seed: Number(result.seed) || 0,
-				duration: Number(result.duration) || 0,
+				caption: request.caption || '',
+				seed: Number(request.seed) || 0,
+				duration: Number(request.duration) || 0,
 				genId: '',
-				request: { ...result },
+				request: { ...request, ...(app.composeLmModel ? { lm_model: app.composeLmModel } : {}) },
 				audio: blob
 			};
 			song.id = await putSong(song);
@@ -242,7 +261,12 @@
 	// save current form edits back into pendingRequests[pendingIndex]
 	function savePending() {
 		if (app.pendingRequests.length > 0 && app.pendingIndex < app.pendingRequests.length) {
-			app.pendingRequests[app.pendingIndex] = buildRequest();
+			const prev = app.pendingRequests[app.pendingIndex];
+			const next = buildRequest();
+			// Pending requests already contain LM-generated content. Keep the LM routing
+			// that produced that content even if the user changes the LM dropdown later.
+			if (prev.lm_model) next.lm_model = prev.lm_model;
+			app.pendingRequests[app.pendingIndex] = next;
 		}
 	}
 
@@ -274,13 +298,18 @@
 	// shared: call an LM endpoint and load results into the form.
 	// LM enriches: caption, lyrics, bpm, duration, keyscale, timesignature, vocal_language, audio_codes.
 	// Everything else is preserved from the current UI state.
-	async function lmCall(fn: (req: AceRequest) => Promise<AceRequest[]>) {
+	async function lmCall(fn: (req: AceRequest) => Promise<{ requests: AceRequest[]; lmModel: string }>) {
 		busy = true;
 		try {
 			const req = buildRequest();
 			req.audio_codes = '';
-			const results = await fn(req);
+			const { requests, lmModel } = await fn(req);
+			const results = requests.map((result) =>
+				lmModel ? { ...result, lm_model: lmModel } : { ...result }
+			);
 			if (results.length > 0) {
+				app.composeLmModel = lmModel || results[0].lm_model || '';
+				app.currentGenId = '';
 				app.pendingRequests = results;
 				app.pendingIndex = 0;
 				setRequest({
@@ -338,8 +367,8 @@
 		busy = true;
 		try {
 			savePending();
-			const reqs: AceRequest[] =
-				app.pendingRequests.length > 0 ? $state.snapshot(app.pendingRequests) : [buildRequest()];
+			const hasPending = app.pendingRequests.length > 0;
+			const reqs: AceRequest[] = hasPending ? $state.snapshot(app.pendingRequests) : [buildRequest()];
 
 			// read synth params from the form (global, not per-pending).
 			const synthBatch = Math.max(1, Number(app.request.synth_batch_size) || 1);
@@ -365,9 +394,8 @@
 			// infer_method from form
 			const im = app.request.infer_method || '';
 			if (im) synthParams.infer_method = im;
-			// model routing from form
+			// synth routing is selected at synth time.
 			if (app.request.synth_model) synthParams.synth_model = app.request.synth_model;
-			if (app.request.lm_model) synthParams.lm_model = app.request.lm_model;
 			if (app.request.lora && loraList.includes(String(app.request.lora)))
 				synthParams.lora = app.request.lora;
 			const loraScale = num(app.request.lora_scale);
@@ -389,9 +417,17 @@
 			const expanded: AceRequest[] = [];
 			for (const r of reqs) {
 				const base = hasSeed ? userSeed : Math.floor(Math.random() * 0x100000000);
-				toSend.push({ ...r, ...synthParams, seed: base, synth_batch_size: synthBatch });
+				const lmModel = hasPending ? r.lm_model : (resolvedLmModel() || r.lm_model);
+				const merged = {
+					...r,
+					...synthParams,
+					...(lmModel ? { lm_model: lmModel } : {}),
+					seed: base,
+					synth_batch_size: synthBatch
+				};
+				toSend.push(merged);
 				for (let i = 0; i < synthBatch; i++) {
-					expanded.push({ ...r, ...synthParams, seed: base + i });
+					expanded.push({ ...merged, seed: base + i });
 				}
 			}
 
@@ -409,6 +445,7 @@
 						)
 					: await synthGenerate(toSend, app.format);
 			const { blobs, genId } = result;
+			app.currentGenId = genId;
 			const now = Date.now();
 			const baseName = app.name || 'Untitled';
 			for (let i = blobs.length - 1; i >= 0; i--) {
@@ -470,6 +507,10 @@
 						<option value={name}>{name}</option>
 					{/each}
 				</select>
+			</div>
+			<div class="model-row">
+				<span class="model-label">Composed LM</span>
+				<input value={app.composeLmModel || ''} readonly placeholder="Updated by Compose" />
 			</div>
 			<div class="model-row">
 				<span class="model-label">DiT</span>

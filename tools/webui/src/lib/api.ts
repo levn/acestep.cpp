@@ -1,6 +1,11 @@
 import type { AceRequest, AceProps } from './types.js';
 import { FETCH_TIMEOUT_MS } from './config.js';
 
+export interface LmResult {
+	requests: AceRequest[];
+	lmModel: string;
+}
+
 // result from synth endpoints: audio blobs + server-assigned generation ID
 export interface SynthResult {
 	blobs: Blob[];
@@ -8,7 +13,7 @@ export interface SynthResult {
 }
 
 // POST lm: partial request -> enriched request(s)
-export async function lmGenerate(req: AceRequest): Promise<AceRequest[]> {
+export async function lmGenerate(req: AceRequest): Promise<LmResult> {
 	const res = await fetch('lm', {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
@@ -18,11 +23,11 @@ export async function lmGenerate(req: AceRequest): Promise<AceRequest[]> {
 		const err = await res.json().catch(() => ({ error: res.statusText }));
 		throw new Error(`${res.status} ${err.error || res.statusText}`);
 	}
-	return res.json();
+	return { requests: await res.json(), lmModel: res.headers.get('X-LM-Model') || '' };
 }
 
 // POST lm?mode=inspire: short caption -> metadata + lyrics (no codes)
-export async function lmInspire(req: AceRequest): Promise<AceRequest[]> {
+export async function lmInspire(req: AceRequest): Promise<LmResult> {
 	const res = await fetch('lm?mode=inspire', {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
@@ -32,11 +37,11 @@ export async function lmInspire(req: AceRequest): Promise<AceRequest[]> {
 		const err = await res.json().catch(() => ({ error: res.statusText }));
 		throw new Error(`${res.status} ${err.error || res.statusText}`);
 	}
-	return res.json();
+	return { requests: await res.json(), lmModel: res.headers.get('X-LM-Model') || '' };
 }
 
 // POST lm?mode=format: caption + lyrics -> metadata + lyrics (no codes)
-export async function lmFormat(req: AceRequest): Promise<AceRequest[]> {
+export async function lmFormat(req: AceRequest): Promise<LmResult> {
 	const res = await fetch('lm?mode=format', {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
@@ -46,7 +51,7 @@ export async function lmFormat(req: AceRequest): Promise<AceRequest[]> {
 		const err = await res.json().catch(() => ({ error: res.statusText }));
 		throw new Error(`${res.status} ${err.error || res.statusText}`);
 	}
-	return res.json();
+	return { requests: await res.json(), lmModel: res.headers.get('X-LM-Model') || '' };
 }
 
 // POST synth[?wav=1]: request(s) -> audio blob(s) + generation ID
@@ -158,7 +163,7 @@ export async function understandAudio(
 	blob: Blob,
 	lmModel?: string,
 	synthModel?: string
-): Promise<AceRequest> {
+): Promise<{ request: AceRequest; lmModel: string }> {
 	const form = new FormData();
 	form.append('audio', blob, 'input.audio');
 	const fields: Record<string, string> = {};
@@ -179,7 +184,7 @@ export async function understandAudio(
 		const err = await res.json().catch(() => ({ error: res.statusText }));
 		throw new Error(`${res.status} ${err.error || res.statusText}`);
 	}
-	return res.json();
+	return { request: await res.json(), lmModel: res.headers.get('X-LM-Model') || '' };
 }
 
 // GET props: server config, pipeline status, default request (2s timeout)
