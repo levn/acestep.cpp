@@ -992,6 +992,11 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
     request_init(&ace_req);
     ace_req.lm_temperature = 0.3f;  // understand default: lower than generation
     ace_req.lm_top_p       = 1.0f;  // understand default: no nucleus sampling
+    ServerFields sf;
+    sf.synth_model = "";
+    sf.lm_model    = "";
+    sf.lora        = "";
+    sf.lora_scale  = 1.0f;
 
     // parse server fields + request
     ServerFields sf;
@@ -1000,20 +1005,26 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
 
     if (req.is_multipart_form_data()) {
         // multipart: required "audio" part, optional "request" part for sampling params
+        // and server-side routing fields such as lm_model.
         if (req.form.has_file("request")) {
             const std::string & json = req.form.get_file("request").content;
-            parse_server_fields(json.c_str(), &sf);
             if (!request_parse_json(&ace_req, json.c_str())) {
                 json_error(res, 400, "Multipart: invalid JSON in 'request' part");
                 return;
             }
+            parse_server_fields(json.c_str(), &sf);
         } else if (req.form.has_field("request")) {
             const std::string & json = req.form.get_field("request");
-            parse_server_fields(json.c_str(), &sf);
             if (!request_parse_json(&ace_req, json.c_str())) {
                 json_error(res, 400, "Multipart: invalid JSON in 'request' part");
                 return;
             }
+            parse_server_fields(json.c_str(), &sf);
+        }
+        if (req.form.has_field("lm_model")) {
+            sf.lm_model = req.form.get_field("lm_model");
+        } else if (req.form.has_file("lm_model")) {
+            sf.lm_model = req.form.get_file("lm_model").content;
         }
 
         if (!req.form.has_file("audio")) {
@@ -1047,6 +1058,7 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
             json_error(res, 400, "Invalid JSON");
             return;
         }
+        parse_server_fields(req.body.c_str(), &sf);
     }
 
     auto lock = try_gpu_lock(res);
@@ -1057,6 +1069,8 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
     // load (LM + tokenizer from selected DiT)
     std::string lm_name  = resolve_name(g_registry.lm, sf.lm_model, g_loaded_lm);
     std::string dit_name = resolve_name(g_registry.dit, sf.synth_model, g_loaded_dit);
+    fprintf(stderr, "[Server] Understand LM requested='%s' loaded='%s' resolved='%s'\n",
+            sf.lm_model.c_str(), g_loaded_lm.c_str(), lm_name.c_str());
     if (!ensure_understand(lm_name, dit_name)) {
         json_error(res, 500, "Failed to load understand pipeline");
         return;
@@ -1487,6 +1501,8 @@ int main(int argc, char ** argv) {
                 res.set_content("Error: gzip is not supported by this browser", "text/plain");
             } else {
                 res.set_header("Content-Encoding", "gzip");
+                res.set_header("Cache-Control", "no-store, max-age=0");
+                res.set_header("Pragma", "no-cache");
                 res.set_content(reinterpret_cast<const char *>(index_html_gz), index_html_gz_len,
                                 "text/html; charset=utf-8");
             }

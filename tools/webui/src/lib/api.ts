@@ -158,21 +158,19 @@ function parseMultipart(buf: Uint8Array, boundary: string, mime: string): Blob[]
 }
 
 // POST /understand: audio file -> AceRequest with metadata + lyrics + codes.
-// sends multipart/form-data with an "audio" part and optional "request" JSON.
+// sends multipart/form-data with an "audio" part (WAV or MP3), and can
+// optionally include request JSON for LM routing and sampling params.
 export async function understandAudio(
 	blob: Blob,
-	lmModel?: string,
-	synthModel?: string
+	req?: Partial<AceRequest>
 ): Promise<{ request: AceRequest; lmModel: string }> {
 	const form = new FormData();
 	form.append('audio', blob, 'input.audio');
-	const fields: Record<string, string> = {};
-	if (lmModel) fields.lm_model = lmModel;
-	if (synthModel) fields.synth_model = synthModel;
-	if (Object.keys(fields).length > 0) {
+	if (req?.lm_model) form.append('lm_model', req.lm_model);
+	if (req && Object.keys(req).length > 0) {
 		form.append(
 			'request',
-			new Blob([JSON.stringify(fields)], { type: 'application/json' }),
+			new Blob([JSON.stringify(req)], { type: 'application/json' }),
 			'request.json'
 		);
 	}

@@ -25,6 +25,8 @@
 
 	let busy = $state(false);
 	let fileInput: HTMLInputElement;
+	type ImportMode = 'open' | 'source';
+	let importMode: ImportMode = $state('open');
 
 	let d = $derived(app.props?.default);
 	let ditModels = $derived(app.props?.models.dit ?? []);
@@ -111,6 +113,14 @@
 	}
 
 	function importJson() {
+		importMode = 'open';
+		fileInput.accept = '.json,.mp3,.wav';
+		fileInput.click();
+	}
+
+	function importSourceOnly() {
+		importMode = 'source';
+		fileInput.accept = '.mp3,.wav';
 		fileInput.click();
 	}
 
@@ -118,10 +128,22 @@
 		const input = e.target as HTMLInputElement;
 		const file = input.files?.[0];
 		if (!file) return;
+		const mode = importMode;
+		importMode = 'open';
+		input.accept = '.json,.mp3,.wav';
 		// reset so the same file can be re-opened
 		input.value = '';
 
 		const ext = file.name.split('.').pop()?.toLowerCase() || '';
+
+		if (mode === 'source') {
+			if (ext === 'mp3' || ext === 'wav') {
+				importAudioAsSourceOnly(file, ext);
+				return;
+			}
+			toast('Source only accepts MP3 or WAV');
+			return;
+		}
 
 		// JSON: load request into form (existing behavior)
 		if (ext === 'json') {
@@ -164,8 +186,7 @@
 			});
 			const { request, lmModel } = await understandAudio(
 				blob,
-				app.request.lm_model as string,
-				app.request.synth_model as string
+				{ lm_model: app.request.lm_model as string, synth_model: app.request.synth_model as string }
 			);
 
 			setRequest(request);
@@ -194,6 +215,39 @@
 			app.songs.unshift(song);
 
 			toast('Imported: ' + name, 4000, true);
+		} catch (e: unknown) {
+			toast(e instanceof Error ? e.message : String(e));
+		} finally {
+			busy = false;
+		}
+	}
+
+	// import audio as a conditioning asset only: create a playable song card,
+	// mark it as the active source, and keep the current request form unchanged.
+	async function importAudioAsSourceOnly(file: File, ext: string) {
+		busy = true;
+		try {
+			const blob = new Blob([await file.arrayBuffer()], {
+				type: ext === 'wav' ? 'audio/wav' : 'audio/mpeg'
+			});
+			const name = file.name.replace(/\.(mp3|wav)$/i, '') || 'Imported';
+			const song: Song = {
+				name,
+				format: ext,
+				created: Date.now(),
+				caption: '',
+				seed: 0,
+				duration: 0,
+				genId: '',
+				request: { caption: '' },
+				audio: blob
+			};
+			song.id = await putSong(song);
+			app.songs.unshift(song);
+			app.srcSongId = song.id ?? null;
+			app.srcRangeStart = -1;
+			app.srcRangeEnd = -1;
+			toast('Imported as source: ' + name, 4000, true);
 		} catch (e: unknown) {
 			toast(e instanceof Error ? e.message : String(e));
 		} finally {
@@ -489,6 +543,9 @@
 	<div class="toolbar">
 		<button type="button" onclick={importJson} title="Open JSON prompt, MP3 or WAV"
 			><FolderOpen size={14} /> Open</button
+		>
+		<button type="button" onclick={importSourceOnly} title="Import MP3 or WAV as source only"
+			><FolderOpen size={14} /> Source</button
 		>
 		<button type="button" onclick={exportJson} title="Save JSON prompt"
 			><Download size={14} /> Save</button
