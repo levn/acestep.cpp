@@ -64,7 +64,7 @@ int ops_encode_src(AceSynth * ctx, const float * src_audio, int src_len, SynthSt
         int T_audio = src_len;
 
         VAEEncoder vae_enc = {};
-        vae_enc_load(&vae_enc, ctx->params.vae_path);
+        vae_enc_load(&vae_enc, ctx->params.vae_path, ctx->params.vae_cpu);
         int max_T_lat = (T_audio / 1920) + 64;
         s.cover_latents.resize(max_T_lat * 64);
 
@@ -248,7 +248,7 @@ void ops_encode_timbre(AceSynth * ctx, const float * ref_audio, int ref_len, Syn
     if (ref_audio && ref_len > 0) {
         s.timer.reset();
         VAEEncoder ref_vae = {};
-        vae_enc_load(&ref_vae, ctx->params.vae_path);
+        vae_enc_load(&ref_vae, ctx->params.vae_path, ctx->params.vae_cpu);
         int                max_T_ref = (ref_len / 1920) + 64;
         std::vector<float> ref_latents(max_T_ref * 64);
         int                T_ref = vae_enc_encode_tiled(&ref_vae, ref_audio, ref_len, ref_latents.data(), max_T_ref,

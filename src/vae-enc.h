@@ -28,6 +28,7 @@ struct VAEEncoder {
     ggml_backend_sched_t  sched;
     ggml_backend_buffer_t buf;
     struct ggml_context * weight_ctx;
+    bool                  owns_backend;  // true when standalone CPU backend (force_cpu)
 
     // graph cache (rebuilt when T_audio changes)
     struct ggml_context * graph_ctx;
@@ -40,8 +41,9 @@ struct VAEEncoder {
     std::vector<float> scratch_in;       // transposed input [2 * T_audio]
 };
 
-// Load encoder weights from the same VAE GGUF (encoder.* tensors)
-static void vae_enc_load(VAEEncoder * m, const char * path) {
+// Load encoder weights from the same VAE GGUF (encoder.* tensors).
+// force_cpu: load onto a standalone CPU backend (mirrors vae_ggml_load).
+static void vae_enc_load(VAEEncoder * m, const char * path, bool force_cpu = false) {
     GGUFModel gf = {};
     if (!gf_load(&gf, path)) {
         fprintf(stderr, "[VAE-Enc] FATAL: cannot load %s\n", path);
@@ -105,10 +107,11 @@ static void vae_enc_load(VAEEncoder * m, const char * path) {
     m->c2b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
 
     // Phase 2: allocate backend buffer
-    BackendPair bp = backend_init("VAE-Enc");
-    m->backend     = bp.backend;
-    m->cpu_backend = bp.cpu_backend;
-    m->sched       = backend_sched_new(bp, 8192);
+    BackendPair bp  = force_cpu ? backend_init_cpu_standalone("VAE-Enc") : backend_init("VAE-Enc");
+    m->backend      = bp.backend;
+    m->cpu_backend  = bp.cpu_backend;
+    m->owns_backend = force_cpu;
+    m->sched        = backend_sched_new(bp, 8192);
     m->buf         = ggml_backend_alloc_ctx_tensors(ctx, m->backend);
     if (!m->buf) {
         fprintf(stderr, "[VAE-Enc] FATAL: failed to allocate weight buffer\n");
@@ -400,6 +403,10 @@ static void vae_enc_free(VAEEncoder * m) {
     if (m->weight_ctx) {
         ggml_free(m->weight_ctx);
     }
-    backend_release(m->backend, m->cpu_backend);
+    if (m->owns_backend) {
+        backend_release_standalone(m->backend);
+    } else {
+        backend_release(m->backend, m->cpu_backend);
+    }
     *m = {};
 }
