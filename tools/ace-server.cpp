@@ -999,7 +999,6 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
     sf.lora_scale  = 1.0f;
 
     // parse server fields + request
-    ServerFields sf;
     auto src_interleaved = make_cfloat();
     int  src_len         = 0;
 
