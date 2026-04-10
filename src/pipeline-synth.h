@@ -20,6 +20,7 @@ struct AceSynthParams {
     bool         clamp_fp16;         // clamp hidden states to FP16 range (default: false)
     int          vae_chunk;          // latent frames per tile (default: 256)
     int          vae_overlap;        // overlap frames per side (default: 64)
+    bool         vae_cpu;            // force VAE onto a dedicated CPU backend (default: false)
     const char * dump_dir;           // intermediate tensor dump dir (NULL = disabled)
 };
 

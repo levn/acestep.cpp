@@ -45,6 +45,7 @@ struct VAEGGML {
     ggml_backend_sched_t  sched;
     ggml_backend_buffer_t buf;
     struct ggml_context * weight_ctx;  // holds weight tensor metadata
+    bool                  owns_backend;  // true when backend was created standalone (force_cpu)
 
     // Graph cache for tiled decode (avoids rebuild per tile)
     struct ggml_context * graph_ctx;
@@ -163,8 +164,10 @@ static void vae_load_bias(struct ggml_tensor * dst, const GGUFModel & gf, const 
     ggml_backend_tensor_set(dst, d.data(), 0, C * sizeof(float));
 }
 
-// Load model
-static void vae_ggml_load(VAEGGML * m, const char * path) {
+// Load model. When force_cpu is true, VAE is loaded onto a standalone CPU
+// backend instead of sharing the primary (GPU) backend. Useful on hardware
+// where GPU VAE is slower or less reliable than CPU VAE (e.g. AMD iGPUs).
+static void vae_ggml_load(VAEGGML * m, const char * path, bool force_cpu = false) {
     GGUFModel gf = {};
     if (!gf_load(&gf, path)) {
         fprintf(stderr, "[VAE] FATAL: cannot load %s\n", path);
@@ -214,10 +217,11 @@ static void vae_ggml_load(VAEGGML * m, const char * path) {
     m->c2w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 7, 128, 2);
 
     // Phase 2: allocate backend buffer
-    BackendPair bp = backend_init("VAE");
-    m->backend     = bp.backend;
-    m->cpu_backend = bp.cpu_backend;
-    m->sched       = backend_sched_new(bp, 8192);
+    BackendPair bp  = force_cpu ? backend_init_cpu_standalone("VAE") : backend_init("VAE");
+    m->backend      = bp.backend;
+    m->cpu_backend  = bp.cpu_backend;
+    m->owns_backend = force_cpu;
+    m->sched        = backend_sched_new(bp, 8192);
     m->buf         = ggml_backend_alloc_ctx_tensors(ctx, m->backend);
     if (!m->buf) {
         fprintf(stderr, "[VAE] FATAL: failed to allocate weight buffer\n");
@@ -568,6 +572,10 @@ static void vae_ggml_free(VAEGGML * m) {
     if (m->weight_ctx) {
         ggml_free(m->weight_ctx);
     }
-    backend_release(m->backend, m->cpu_backend);
+    if (m->owns_backend) {
+        backend_release_standalone(m->backend);
+    } else {
+        backend_release(m->backend, m->cpu_backend);
+    }
     *m = {};
 }
