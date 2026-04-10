@@ -112,6 +112,27 @@ static BackendPair backend_init(const char * label) {
     return bp;
 }
 
+// Initialize a standalone CPU-only backend, independent from the shared
+// GPU/CPU cache used by backend_init. Intended for modules that want to
+// force CPU execution even when a GPU backend is in use elsewhere
+// (e.g. VAE on AMD iGPUs where Vulkan VAE is slower than CPU VAE).
+// The returned pair has backend == cpu_backend, both owned by the caller,
+// and must be released with backend_release_standalone.
+static BackendPair backend_init_cpu_standalone(const char * label) {
+    ggml_backend_load_all();  // idempotent; ensures CPU device is registered
+    BackendPair bp = {};
+    int         n  = backend_cpu_n_threads();
+    bp.backend     = cpu_backend_new(n);
+    if (!bp.backend) {
+        fprintf(stderr, "[Load] FATAL: failed to init standalone CPU backend for %s\n", label);
+        exit(1);
+    }
+    bp.cpu_backend = bp.backend;
+    fprintf(stderr, "[Load] %s backend: %s (standalone, CPU threads: %d)\n", label,
+            ggml_backend_name(bp.backend), n);
+    return bp;
+}
+
 // Release a backend reference. Frees GPU + CPU backends when refcount hits 0.
 static void backend_release(ggml_backend_t backend, ggml_backend_t cpu_backend) {
     if (g_backend_refs <= 0) {
@@ -126,6 +147,14 @@ static void backend_release(ggml_backend_t backend, ggml_backend_t cpu_backend) 
             ggml_backend_free(cpu_backend);
         }
         g_backend_cache = {};
+    }
+}
+
+// Release a standalone CPU backend created with backend_init_cpu_standalone.
+// Does not touch the shared refcount.
+static void backend_release_standalone(ggml_backend_t backend) {
+    if (backend) {
+        ggml_backend_free(backend);
     }
 }
 

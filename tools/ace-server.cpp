@@ -1183,6 +1183,8 @@ static void usage(const char * prog) {
             "  --keep-loaded           Keep models in VRAM between requests\n"
             "  --vae-chunk <N>         Latent frames per tile (default: 256)\n"
             "  --vae-overlap <N>       Overlap frames per side (default: 64)\n"
+            "  --vae-cpu               Run VAE on CPU even when a GPU backend is active\n"
+            "                          (faster on AMD iGPUs; DiT still runs on GPU)\n"
             "\n"
             "Output:\n"
             "  --mp3-bitrate <kbps>    MP3 bitrate (default: 128)\n"
@@ -1231,6 +1233,8 @@ int main(int argc, char ** argv) {
             g_synth_params.vae_chunk = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--vae-overlap") && i + 1 < argc) {
             g_synth_params.vae_overlap = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--vae-cpu")) {
+            g_synth_params.vae_cpu = true;
         } else if (!strcmp(argv[i], "--keep-loaded")) {
             g_keep_loaded = true;
 

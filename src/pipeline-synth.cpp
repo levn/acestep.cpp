@@ -40,6 +40,7 @@ void ace_synth_default_params(AceSynthParams * p) {
     p->clamp_fp16        = false;
     p->vae_chunk         = 256;
     p->vae_overlap       = 64;
+    p->vae_cpu           = false;
     p->dump_dir          = NULL;
 }
 
@@ -111,8 +112,9 @@ AceSynth * ace_synth_load(const AceSynthParams * params) {
     ctx->vae = {};
     if (params->vae_path) {
         timer.reset();
-        vae_ggml_load(&ctx->vae, params->vae_path);
-        fprintf(stderr, "[Synth-Load] VAE weights: %.1f ms\n", timer.ms());
+        vae_ggml_load(&ctx->vae, params->vae_path, params->vae_cpu);
+        fprintf(stderr, "[Synth-Load] VAE weights: %.1f ms%s\n", timer.ms(),
+                params->vae_cpu ? " (forced CPU)" : "");
         ctx->have_vae = true;
     }
 
