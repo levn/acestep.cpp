@@ -153,8 +153,7 @@
 					const parsed = JSON.parse(text) as AceRequest & { generation_id?: string };
 					setRequest(parsed);
 					app.composeLmModel = parsed.lm_model || '';
-					app.currentGenId =
-						typeof parsed.generation_id === 'string' ? parsed.generation_id : '';
+					app.currentGenId = typeof parsed.generation_id === 'string' ? parsed.generation_id : '';
 					app.name = file.name.replace(/\.json$/i, '') || 'Imported';
 					app.pendingRequests = [];
 					app.pendingIndex = 0;
@@ -184,10 +183,10 @@
 			const blob = new Blob([await file.arrayBuffer()], {
 				type: ext === 'wav' ? 'audio/wav' : 'audio/mpeg'
 			});
-			const { request, lmModel } = await understandAudio(
-				blob,
-				{ lm_model: app.request.lm_model as string, synth_model: app.request.synth_model as string }
-			);
+			const { request, lmModel } = await understandAudio(blob, {
+				lm_model: app.request.lm_model as string,
+				synth_model: app.request.synth_model as string
+			});
 
 			setRequest(request);
 			app.composeLmModel = lmModel || request.lm_model || '';
@@ -352,7 +351,9 @@
 	// shared: call an LM endpoint and load results into the form.
 	// LM enriches: caption, lyrics, bpm, duration, keyscale, timesignature, vocal_language, audio_codes.
 	// Everything else is preserved from the current UI state.
-	async function lmCall(fn: (req: AceRequest) => Promise<{ requests: AceRequest[]; lmModel: string }>) {
+	async function lmCall(
+		fn: (req: AceRequest) => Promise<{ requests: AceRequest[]; lmModel: string }>
+	) {
 		busy = true;
 		try {
 			const req = buildRequest();
@@ -422,7 +423,9 @@
 		try {
 			savePending();
 			const hasPending = app.pendingRequests.length > 0;
-			const reqs: AceRequest[] = hasPending ? $state.snapshot(app.pendingRequests) : [buildRequest()];
+			const reqs: AceRequest[] = hasPending
+				? $state.snapshot(app.pendingRequests)
+				: [buildRequest()];
 
 			// read synth params from the form (global, not per-pending).
 			const synthBatch = Math.max(1, Number(app.request.synth_batch_size) || 1);
@@ -471,7 +474,7 @@
 			const expanded: AceRequest[] = [];
 			for (const r of reqs) {
 				const base = hasSeed ? userSeed : Math.floor(Math.random() * 0x100000000);
-				const lmModel = hasPending ? r.lm_model : (resolvedLmModel() || r.lm_model);
+				const lmModel = hasPending ? r.lm_model : resolvedLmModel() || r.lm_model;
 				const merged = {
 					...r,
 					...synthParams,

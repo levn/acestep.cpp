@@ -10,4 +10,9 @@ loras/*/
 loras/*.safetensors
 __pycache__/
 node_modules/
+
+# Local scripts and config
+.codex/
+server.sh
+buildserver.sh
 tools/webui/dist/

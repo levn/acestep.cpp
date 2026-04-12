@@ -139,9 +139,7 @@
 			<button class="icon-btn" onclick={downloadJson} title="Download JSON"
 				><FileJson size={14} /></button
 			>
-			<button class="icon-btn" onclick={remove} title="Delete track"
-				><Trash2 size={14} /></button
-			>
+			<button class="icon-btn" onclick={remove} title="Delete track"><Trash2 size={14} /></button>
 		</div>
 	</div>
 	<Waveform
