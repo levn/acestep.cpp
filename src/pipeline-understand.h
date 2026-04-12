@@ -20,6 +20,7 @@ struct AceUnderstandParams {
     bool         use_fa;       // flash attention (default: true)
     int          vae_chunk;    // latent frames per tile (default: 256)
     int          vae_overlap;  // overlap frames per side (default: 64)
+    bool         vae_cpu;      // force VAE encoder onto CPU (default: false)
 
     // shared LM from pipeline-lm (NULL = load own copy from model_path)
     Qwen3LM *      shared_model;

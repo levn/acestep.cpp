@@ -1336,6 +1336,7 @@ int main(int argc, char ** argv) {
     ace_understand_default_params(&g_und_params);
     g_und_params.use_fa  = g_lm_params.use_fa;
     g_und_params.use_fsm = g_lm_params.use_fsm;
+    g_und_params.vae_cpu = g_synth_params.vae_cpu;
     if (have_vae) {
         g_und_params.vae_path = g_registry.vae[0].path.c_str();
     }

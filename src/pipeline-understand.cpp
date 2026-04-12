@@ -87,6 +87,7 @@ void ace_understand_default_params(AceUnderstandParams * p) {
     p->use_fa       = true;
     p->vae_chunk    = 256;
     p->vae_overlap  = 64;
+    p->vae_cpu      = false;
     p->shared_model = NULL;
     p->shared_bpe   = NULL;
 }
@@ -112,7 +113,7 @@ AceUnderstand * ace_understand_load(const AceUnderstandParams * params) {
     if (params->vae_path) {
         fprintf(stderr, "[Understand-Load] VAE-Enc loading %s...\n", params->vae_path);
         ctx->vae_enc = {};
-        vae_enc_load(&ctx->vae_enc, params->vae_path);
+        vae_enc_load(&ctx->vae_enc, params->vae_path, params->vae_cpu);
         ctx->have_vae_enc = true;
     }
 

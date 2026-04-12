@@ -504,7 +504,9 @@
 			const { blobs, genId } = result;
 			app.currentGenId = genId;
 			const now = Date.now();
-			const baseName = app.name || 'Untitled';
+			const rawName = app.name || 'Untitled';
+			const taskTag = synthParams.task_type || '';
+			const baseName = taskTag && taskTag !== 'text2music' ? `${rawName} [${taskTag}]` : rawName;
 			for (let i = blobs.length - 1; i >= 0; i--) {
 				const r = expanded[i];
 				const song = {
