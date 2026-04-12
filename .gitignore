@@ -13,6 +13,6 @@ node_modules/
 
 # Local scripts and config
 .codex
-server.sh
 buildserver.sh
+run.sh
 tools/webui/dist/
